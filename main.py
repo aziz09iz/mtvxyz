@@ -7,8 +7,8 @@ import json
 import re
 from datetime import timedelta, timezone
 from dotenv import load_dotenv
-from telegram import Update, constants
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from google import genai
 from google.genai import types
 import edge_tts 
@@ -32,12 +32,11 @@ except Exception as e:
 
 AVAILABLE_MODELS = []
 
-# --- UTILS: TIMEZONE (WIB) ---
+# --- UTILS ---
 def get_wib_time():
-    """Mengambil waktu saat ini dalam WIB (UTC+7)."""
+    """Waktu WIB (UTC+7)."""
     utc_now = datetime.datetime.now(timezone.utc)
-    wib_now = utc_now + timedelta(hours=7)
-    return wib_now
+    return utc_now + timedelta(hours=7)
 
 # --- SYSTEM: MODEL DISCOVERY ---
 def refresh_available_models():
@@ -47,7 +46,6 @@ def refresh_available_models():
     try:
         for m in client.models.list():
             name = m.name.replace("models/", "")
-            # Filter model TTS/Audio agar tidak error
             if "tts" in name or "audio" in name or "embedding" in name or "imagen" in name:
                 continue
             found_models.append(name)
@@ -58,7 +56,7 @@ def refresh_available_models():
         
         AVAILABLE_MODELS = flash_models + pro_models + other_models
         if not AVAILABLE_MODELS: AVAILABLE_MODELS = ["gemini-1.5-flash"]
-        print(f"✅ AI Engine Ready. Primary Core: {AVAILABLE_MODELS[0]}")
+        print(f"✅ AI Engine Ready. Primary: {AVAILABLE_MODELS[0]}")
     except:
         AVAILABLE_MODELS = ["gemini-1.5-flash"]
 
@@ -75,29 +73,27 @@ async def create_voice_note(text, filename="voice.mp3"):
         logging.error(f"TTS Error: {e}")
         return None
 
-# --- SERVICE: INTELLIGENCE (GEMINI JSON MODE) ---
+# --- SERVICE: INTELLIGENCE (GEMINI JSON) ---
 async def get_gemini_content():
-    """Generate konten terpisah (Teks Chat vs Script Audio) via JSON."""
+    """Generate konten JSON dengan Emoji."""
     
     themes = [
-        "Strategic Thinking", "High Performance Habit", "Emotional Intelligence",
-        "Financial Wisdom", "Leadership", "Resilience", "Mindfulness", "Time Mastery",
-        "Personal Branding", "Critical Thinking"
+        "Growth Mindset", "Financial Freedom", "High Performance", 
+        "Emotional Mastery", "Leadership", "Stoicism", "Focus & Flow"
     ]
     theme = random.choice(themes)
     
-    # Prompt khusus meminta JSON
     prompt = (
-        f"Role: Executive Coach. Topik: {theme}.\n"
-        "Tugas: Berikan output dalam format **JSON Murni** (tanpa markdown ```json).\n"
-        "Struktur JSON harus memiliki 3 kunci:\n"
-        "1. 'insight': Kutipan mendalam (maksimal 2 kalimat) untuk dibaca di chat.\n"
-        "2. 'action': Tantangan konkret 5 menit untuk dilakukan user.\n"
-        "3. 'script': Narasi lengkap, panjang, dan mengalir untuk dibacakan sebagai Voice Note (sapa user, jelaskan insight, lalu ajak lakukan aksi).\n\n"
-        "Pastikan bahasa Indonesia elegan, profesional, dan menyentuh."
+        f"Role: Executive Mentor. Topik: {theme}.\n"
+        "Output: **JSON Murni** (3 keys: insight, action, script).\n\n"
+        "Style Guide:\n"
+        "1. **'insight'**: 2 kalimat bijak & nendang. WAJIB sisipkan 1-2 emoji relevan di tengah/akhir kalimat.\n"
+        "2. **'action'**: Tantangan 5 menit. WAJIB sisipkan 1 emoji ikonik (misal: 🔥, 📝, 💧).\n"
+        "3. **'script'**: Narasi Voice Note panjang (sapaan hangat, penjelasan insight, ajakan action). Tanpa emoji (karena untuk suara).\n"
+        "Bahasa: Indonesia Profesional, Elegan, namun Membakar Semangat."
     )
 
-    config = types.GenerateContentConfig(temperature=0.7)
+    config = types.GenerateContentConfig(temperature=0.75)
 
     for model_name in AVAILABLE_MODELS:
         try:
@@ -108,26 +104,16 @@ async def get_gemini_content():
                 config=config
             )
             raw_text = response.text.strip()
-            
-            # Bersihkan jika AI tidak sengaja pakai markdown code block
             clean_json = re.sub(r"```json|```", "", raw_text).strip()
-            
-            # Parsing JSON
             data = json.loads(clean_json)
             return data
-            
-        except json.JSONDecodeError:
-            logging.warning(f"⚠️ JSON Parse Error di {model_name}. Retrying...")
+        except Exception:
             continue
-        except Exception as e:
-            if "429" in str(e) or "404" in str(e): continue
-            logging.error(f"AI Error ({model_name}): {e}")
 
-    # Fallback Data jika semua error
     return {
-        "insight": "Ketenangan adalah kunci kejernihan berpikir.",
-        "action": "Ambil nafas dalam selama 1 menit.",
-        "script": "Halo, mohon maaf sistem sedang sibuk. Namun ingatlah bahwa ketenangan adalah kunci."
+        "insight": "🌱 Ketenangan adalah kekuatan tertinggi. Di tengah badai, pikiran yang jernih adalah nahkoda terbaik.",
+        "action": "🌬️ Tarik nafas dalam selama 4 detik, tahan 4 detik, hembuskan 4 detik. Ulangi 3 kali sekarang.",
+        "script": "Halo. Terkadang kita lupa bahwa kekuatan terbesar ada dalam ketenangan. Ambil nafas sejenak dan kembali fokus."
     }
 
 # --- TELEGRAM INTERFACE ---
@@ -136,29 +122,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user.first_name
     
+    # --- TAMPILAN DASHBOARD PREMIUM ---
     welcome_msg = (
-        f"✨ **Selamat Datang, {user}.**\n\n"
-        "Saya adalah **AI Personal Growth Assistant** Anda.\n"
-        "Sistem kini telah aktif dan tersinkronisasi dengan Waktu Indonesia Barat (WIB).\n\n"
-        "📊 **Layanan Otomatis:**\n"
-        "• *Hourly Insight:* Pesan bijak setiap pergantian jam.\n"
-        "• *Action Plan:* Tugas mikro untuk progres nyata.\n"
-        "• *Audio Experience:* Motivasi dalam format suara.\n\n"
-        "Insight pertama akan dikirim tepat pada jam berikutnya."
+        f"👋 **Halo, {user}!**\n"
+        "Selamat datang di Ekosistem Produktivitas Anda.\n\n"
+        "💎 **AI PERSONAL GROWTH ASSISTANT**\n"
+        "Saya hadir untuk memastikan level energi dan fokus Anda tetap di puncak melalui:\n\n"
+        "🧠 **Daily Wisdom** — Insight tajam untuk pola pikir.\n"
+        "⚡ **Micro Actions** — Tantangan nyata, bukan sekadar wacana.\n"
+        "🎧 **Audio Briefing** — Motivasi eksklusif via suara.\n\n"
+        "⚙️ _Sistem telah aktif. Insight akan dikirim otomatis setiap jam._"
     )
     
-    await update.message.reply_text(welcome_msg, parse_mode=constants.ParseMode.MARKDOWN)
+    # TOMBOL INTERAKTIF (Inline Keyboard)
+    keyboard = [
+        [InlineKeyboardButton("⚡ Unlock Insight Sekarang", callback_data='trigger_now')],
+        [InlineKeyboardButton("🛑 Matikan Layanan", callback_data='stop_service')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Logic Sync Waktu WIB
+    await update.message.reply_text(welcome_msg, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=reply_markup)
+    
+    # Setup Schedule (WIB)
+    setup_schedule(context, chat_id)
+
+def setup_schedule(context, chat_id):
+    """Fungsi pembantu untuk atur jadwal."""
     now_wib = get_wib_time()
     next_hour = (now_wib + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-    
-    # Hitung selisih detik dari sekarang sampai jam berikutnya
     seconds_until_next = (next_hour - now_wib).total_seconds()
     
+    # Hapus job lama
     current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
     for job in current_jobs: job.schedule_removal()
     
+    # Buat job baru
     context.job_queue.run_repeating(
         send_motivation_routine, 
         interval=3600, 
@@ -166,92 +164,80 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=chat_id, 
         name=str(chat_id)
     )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menangani Klik Tombol."""
+    query = update.callback_query
+    await query.answer() # Hilangkan loading di tombol
     
-    await update.message.reply_text(
-        f"⏳ *Sinkronisasi Waktu WIB...*\nNext Insight: `{next_hour.strftime('%H:%M')} WIB`",
-        parse_mode=constants.ParseMode.MARKDOWN
-    )
+    if query.data == 'trigger_now':
+        await query.edit_message_reply_markup(reply_markup=None) # Hilangkan tombol agar rapi
+        await context.bot.send_message(chat_id=query.message.chat_id, text="🚀 *Memproses permintaan prioritas...*", parse_mode='Markdown')
+        
+        # Inject job manual
+        class DummyJob:
+            def __init__(self, chat_id): self.chat_id = chat_id
+        context.job = DummyJob(query.message.chat_id)
+        await send_motivation_routine(context)
+        
+    elif query.data == 'stop_service':
+        # Panggil fungsi stop
+        chat_id = query.message.chat_id
+        current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+        for job in current_jobs: job.schedule_removal()
+        
+        await query.edit_message_text(text="🛑 **Layanan Non-Aktif.**\nTekan /start kapan saja untuk kembali.", parse_mode='Markdown')
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-    
-    if not current_jobs:
-        await update.message.reply_text("ℹ️ *Status:* Tidak ada langganan aktif.", parse_mode='Markdown')
-        return
-
     for job in current_jobs: job.schedule_removal()
-    
-    await update.message.reply_text(
-        "🛑 **Layanan Dihentikan.**\nTerima kasih, sampai jumpa kembali.",
-        parse_mode=constants.ParseMode.MARKDOWN
-    )
-
-async def test_motivation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual Trigger."""
-    loading_msg = await update.message.reply_text("⚡ *Generating Professional Insight...*", parse_mode='Markdown')
-    
-    class DummyJob:
-        def __init__(self, chat_id): self.chat_id = chat_id
-    context.job = DummyJob(update.effective_chat.id)
-    
-    await send_motivation_routine(context)
-    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=loading_msg.message_id)
+    await update.message.reply_text("🛑 **Layanan Dihentikan.**", parse_mode=constants.ParseMode.MARKDOWN)
 
 async def send_motivation_routine(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id = job.chat_id
     
-    # 1. Generate Konten (JSON Dictionary)
     data = await get_gemini_content()
-    
-    # 2. Kirim Text (Hanya Insight & Action)
-    # Ambil jam WIB untuk header
     current_time_str = get_wib_time().strftime("%H:%M")
     
+    # --- FORMAT PESAN YANG LEBIH CANTIK ---
     formatted_text = (
-        f"🌟 **DAILY INSIGHT** | ⏱ `{current_time_str} WIB`\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💡 *Insight:*\n{data['insight']}\n\n"
-        f"🔥 *Action Plan:*\n{data['action']}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎧 _Dengarkan audio di bawah untuk brief lengkap._"
+        f"🚀 **GROWTH SIGNAL** | ⏱ `{current_time_str} WIB`\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💡 *INSIGHT*\n{data['insight']}\n\n"
+        f"🎯 *ACTION*\n{data['action']}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🎧 _Audio Briefing Loading..._"
     )
     
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=formatted_text,
-        parse_mode=constants.ParseMode.MARKDOWN
-    )
+    await context.bot.send_message(chat_id=chat_id, text=formatted_text, parse_mode=constants.ParseMode.MARKDOWN)
     
-    # 3. Kirim Audio (Menggunakan script narasi panjang)
+    # Kirim Audio
     await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.RECORD_VOICE)
-    
     filename = f"audio_{chat_id}_{random.randint(1000,9999)}.mp3"
-    # Gunakan data['script'] yang isinya narasi lengkap
     audio_path = await create_voice_note(data['script'], filename)
     
     if audio_path:
         await context.bot.send_voice(
-            chat_id=chat_id,
-            voice=open(audio_path, 'rb'),
-            caption="🎧 *Executive Briefing*",
+            chat_id=chat_id, 
+            voice=open(audio_path, 'rb'), 
+            caption="🎙️ *Executive Briefing*", 
             parse_mode='Markdown'
         )
-        try:
-            os.remove(audio_path)
-        except:
-            pass
+        try: os.remove(audio_path)
+        except: pass
 
-# --- MAIN EXECUTION ---
+# --- MAIN ---
 def main():
     application = Application.builder().token(TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
-    application.add_handler(CommandHandler("test", test_motivation))
+    # Handler untuk Tombol
+    application.add_handler(CallbackQueryHandler(button_handler))
     
-    print("🚀 AI Assistant System Online (WIB Mode)...")
+    print("🚀 Premium Bot Online...")
     application.run_polling()
 
 if __name__ == '__main__':
