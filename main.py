@@ -1,10 +1,12 @@
 import os
 import logging
 import asyncio
+import random
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from google import genai
+from google.genai import types
 
 # 1. Konfigurasi Awal
 load_dotenv()
@@ -16,102 +18,136 @@ logging.basicConfig(
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
+# Cek Ketersediaan Kunci
+if not TOKEN or not GEMINI_KEY:
+    logging.error("❌ TOKEN atau GEMINI_API_KEY belum diisi di Environment Variables!")
+    exit(1)
+
 # Inisialisasi Client
-client = genai.Client(api_key=GEMINI_KEY)
+try:
+    client = genai.Client(api_key=GEMINI_KEY)
+except Exception as e:
+    logging.error(f"❌ Gagal inisialisasi Gemini Client: {e}")
+    exit(1)
 
 # Variable Global
 AVAILABLE_MODELS = []
 
-# --- FUNGSI UTAMA: PERSIAPAN MODEL ---
+# --- FUNGSI 1: AUTO-DETECT MODELS ---
 
 def refresh_available_models():
-    """Scan model dan urutkan prioritas (Flash -> Pro -> Lainnya)."""
+    """Scan model yang tersedia di akun dan urutkan prioritasnya."""
     global AVAILABLE_MODELS
-    print("🔄 Menyiapkan mesin motivasi...")
+    print("🔄 Scanning model AI yang tersedia...")
     
     found_models = []
     try:
+        # Ambil list model dari Google
         for m in client.models.list():
             name = m.name.replace("models/", "")
             found_models.append(name)
         
-        # Prioritas: Flash (Cepat) -> Pro (Pintar) -> Lainnya
+        # Urutan Prioritas: Flash (Cepat & Murah) -> Pro (Pintar) -> Lainnya
         flash_models = [m for m in found_models if "flash" in m and "vision" not in m]
         pro_models = [m for m in found_models if "pro" in m and "vision" not in m]
         other_models = [m for m in found_models if m not in flash_models and m not in pro_models]
         
+        # Gabungkan
         AVAILABLE_MODELS = flash_models + pro_models + other_models
-        print(f"✅ Siap dengan {len(AVAILABLE_MODELS)} jalur model AI.")
+        
+        if not AVAILABLE_MODELS:
+            print("⚠️ Tidak ada model ditemukan. Menggunakan default fallback.")
+            AVAILABLE_MODELS = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-pro"]
+            
+        print(f"✅ Siap! {len(AVAILABLE_MODELS)} model aktif. Prioritas utama: {AVAILABLE_MODELS[0]}")
         
     except Exception as e:
-        print(f"⚠️ Gagal scan model: {e}. Menggunakan mode darurat.")
-        AVAILABLE_MODELS = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-pro"]
+        print(f"⚠️ Gagal scan model (Mungkin API Key bermasalah?): {e}")
+        # Tetap isi default agar bot tidak crash saat start
+        AVAILABLE_MODELS = ["gemini-1.5-flash"]
 
+# Jalankan scan saat bot nyala
 refresh_available_models()
 
-# --- FUNGSI GENERATE (AUTO-SWITCH) ---
+# --- FUNGSI 2: GENERATE MOTIVASI (RANDOMIZED) ---
 
 async def get_gemini_motivation():
-    """Generate motivasi dengan gaya bahasa menarik & rotasi model otomatis."""
+    """Generate motivasi unik dengan topik acak dan failover system."""
     
-    # Prompt yang sudah dipercantik
+    # List topik agar konten selalu fresh
+    topik_list = [
+        "disiplin dan konsistensi", "bangkit dari kegagalan", "bersyukur hal kecil",
+        "kesehatan mental", "fokus masa depan", "belajar skill baru",
+        "kesabaran berproses", "mencintai diri sendiri", "berani ambil resiko",
+        "manajemen waktu", "menghindari penundaan", "kekuatan doa dan usaha"
+    ]
+    
+    topik = random.choice(topik_list)
+    
     prompt = (
-        "Buatkan saya sebuah pesan motivasi yang inspiratif dan agak panjang (sekitar 3-4 kalimat). "
-        "Gunakan bahasa Indonesia yang luwes, akrab, dan menyentuh hati (tidak kaku seperti robot). "
-        "Konteksnya tentang semangat hidup, produktivitas, atau bangkit dari kegagalan. "
-        "Wajib sertakan 2-3 emoji yang relevan di dalam kalimatnya agar terlihat hidup."
+        f"Buatkan satu pesan motivasi singkat (2-3 kalimat) yang sangat 'relate' dan menyentuh hati "
+        f"tentang topik: '{topik}'. "
+        "Gunakan bahasa Indonesia yang santai tapi bijak (tidak kaku). "
+        "Wajib sertakan 1-2 emoji yang relevan."
     )
 
+    # Config agar output kreatif (tidak monoton)
+    config = types.GenerateContentConfig(temperature=0.9)
+
+    # Loop mencoba model satu per satu jika ada yang error/limit
     for model_name in AVAILABLE_MODELS:
         try:
             response = await asyncio.to_thread(
                 client.models.generate_content,
                 model=model_name,
-                contents=prompt
+                contents=prompt,
+                config=config
             )
-            # Sukses? Kembalikan teksnya saja
             return response.text.strip()
 
         except Exception as e:
             error_msg = str(e)
             if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-                logging.warning(f"⚠️ {model_name} sibuk/limit. Pindah ke model cadangan...")
-                continue
-            elif "404" in error_msg or "NOT_FOUND" in error_msg:
-                continue
+                logging.warning(f"⚠️ {model_name} Limit Habis. Mencoba model lain...")
+                continue # Coba model berikutnya
+            elif "403" in error_msg or "PERMISSION_DENIED" in error_msg:
+                logging.critical("❌ API KEY DITOLAK! Cek konfigurasi di Railway.")
+                return "⚠️ Maaf, sistem sedang maintenance (API Key Error)."
+            elif "404" in error_msg:
+                continue # Skip model tidak valid
             else:
-                logging.error(f"❌ Error {model_name}: {e}")
+                logging.error(f"❌ Error pada {model_name}: {e}")
                 continue
 
-    return "🔥 Tetap semangat ya! Maaf, sistem AI sedang istirahat sejenak, tapi kamu harus jalan terus! 💪"
+    return "🔥 Tetap semangat! (Sistem AI sedang sibuk, tapi kamu hebat!). 💪"
 
 # --- HANDLER TELEGRAM ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user_name = update.effective_user.first_name
+    name = update.effective_user.first_name
     
-    # Kata pembuka yang lebih menarik
-    welcome_msg = (
-        f"👋 **Halo, {user_name}! Selamat datang di Zona Semangat!** 🌟\n\n"
-        "Senang banget kamu ada di sini. Mulai sekarang, aku bakal jadi teman setia yang ngirimin "
-        "booster energi positif buat kamu setiap jam. 🔋\n\n"
-        "Gak perlu seting apa-apa, duduk manis aja & biarkan notifikasi dariku bikin harimu lebih cerah!\n\n"
-        "👇 _Menu Singkat:_\n"
-        "✨ /test - Minta motivasi sekarang juga\n"
+    welcome_text = (
+        f"👋 **Halo, {name}! Selamat datang!** 🌟\n\n"
+        "Bot Motivasi AI siap menemani harimu.\n"
+        "Saya akan mengirim pesan positif setiap 1 jam agar kamu tetap semangat! 🔥\n\n"
+        "👇 _Perintah:_\n"
+        "⚡ /test - Coba minta motivasi sekarang\n"
         "🛑 /stop - Berhenti berlangganan"
     )
     
-    await update.message.reply_text(welcome_msg, parse_mode='Markdown')
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
     
-    # Reset & Jadwalkan Ulang (Setiap 1 Jam / 3600 detik)
+    # Hapus job lama agar tidak double
     current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-    for job in current_jobs: job.schedule_removal()
+    for job in current_jobs:
+        job.schedule_removal()
     
+    # Buat job baru (3600 detik = 1 jam)
     context.job_queue.run_repeating(
         send_hourly_motivation, 
-        interval=3600,  # 1 Jam
-        first=10,       # Pesan pertama dikirim 10 detik setelah start
+        interval=3600, 
+        first=10, 
         chat_id=chat_id, 
         name=str(chat_id)
     )
@@ -121,50 +157,49 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
     
     if not current_jobs:
-        await update.message.reply_text("Kamu belum berlangganan kok. Ketik /start untuk mulai! 😊")
+        await update.message.reply_text("Kamu belum berlangganan. Ketik /start untuk mulai.")
         return
 
-    for job in current_jobs: job.schedule_removal()
-    await update.message.reply_text("Oke, jadwal motivasi dimatikan. Kalau butuh semangat lagi, ketik /start ya! 👋")
+    for job in current_jobs:
+        job.schedule_removal()
+    
+    await update.message.reply_text("✅ Berlangganan dihentikan. Sampai jumpa lagi! 👋")
 
 async def test_motivation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Pesan tunggu yang lebih asik
-    status_msg = await update.message.reply_text("⏳ *Meracik kata-kata terbaik untukmu...*", parse_mode='Markdown')
-    
+    msg = await update.message.reply_text("⏳ *Meracik kata-kata semangat...*", parse_mode='Markdown')
     quote = await get_gemini_motivation()
     
-    # Hapus status, ganti dengan quote tanpa info teknis
+    # Update pesan tunggu menjadi quote
     await context.bot.edit_message_text(
         chat_id=update.effective_chat.id,
-        message_id=status_msg.message_id,
-        text=quote # Langsung teks motivasi
+        message_id=msg.message_id,
+        text=quote
     )
 
 async def send_hourly_motivation(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     quote = await get_gemini_motivation()
     
-    # Format pengiriman rutin
     await context.bot.send_message(
         chat_id=job.chat_id,
-        text=f"🔔 *Pengingat Jam Ini:*\n\n{quote}",
+        text=f"🔔 *Reminder Semangat:*\n\n{quote}",
         parse_mode='Markdown'
     )
 
-# --- START ---
+# --- START BOT ---
 
 def main():
-    if not TOKEN:
-        print("Error: TOKEN atau API KEY belum diisi.")
-        return
-
+    # Inisialisasi Aplikasi dengan JobQueue
     application = Application.builder().token(TOKEN).build()
-    
+
+    # Register Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("test", test_motivation))
 
-    print("Bot Motivasi (Versi Final) siap menebar semangat! 🚀")
+    print(f"🚀 Bot Berjalan! Menunggu pesan...")
+    
+    # Jalankan polling (Block main thread)
     application.run_polling()
 
 if __name__ == '__main__':
