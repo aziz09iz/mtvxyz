@@ -31,11 +31,3 @@ Bot ini bukan sekadar pengirim pesan random, melainkan asisten cerdas yang tersi
 
 ---
 
-## ⚙️ Instalasi & Menjalankan Lokal
-
-Ikuti langkah ini untuk menjalankan bot di komputermu sendiri.
-
-### 1. Clone Repository
-```bash
-git clone [https://github.com/username/repo-kamu.git](https://github.com/username/repo-kamu.git)
-cd repo-kamu
