@@ -2,11 +2,14 @@ import os
 import logging
 import asyncio
 import random
+import datetime
+from datetime import timedelta
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from google import genai
 from google.genai import types
+import edge_tts  # Library Suara
 
 # 1. Konfigurasi Awal
 load_dotenv()
@@ -18,83 +21,73 @@ logging.basicConfig(
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
-# Cek Ketersediaan Kunci
 if not TOKEN or not GEMINI_KEY:
-    logging.error("❌ TOKEN atau GEMINI_API_KEY belum diisi di Environment Variables!")
+    logging.error("❌ TOKEN atau GEMINI_API_KEY belum diisi!")
     exit(1)
 
-# Inisialisasi Client
 try:
     client = genai.Client(api_key=GEMINI_KEY)
 except Exception as e:
-    logging.error(f"❌ Gagal inisialisasi Gemini Client: {e}")
+    logging.error(f"❌ Gagal inisialisasi Gemini: {e}")
     exit(1)
 
-# Variable Global
 AVAILABLE_MODELS = []
 
 # --- FUNGSI 1: AUTO-DETECT MODELS ---
-
 def refresh_available_models():
-    """Scan model yang tersedia di akun dan urutkan prioritasnya."""
     global AVAILABLE_MODELS
-    print("🔄 Scanning model AI yang tersedia...")
-    
+    print("🔄 Scanning model AI...")
     found_models = []
     try:
-        # Ambil list model dari Google
         for m in client.models.list():
             name = m.name.replace("models/", "")
             found_models.append(name)
         
-        # Urutan Prioritas: Flash (Cepat & Murah) -> Pro (Pintar) -> Lainnya
         flash_models = [m for m in found_models if "flash" in m and "vision" not in m]
         pro_models = [m for m in found_models if "pro" in m and "vision" not in m]
         other_models = [m for m in found_models if m not in flash_models and m not in pro_models]
         
-        # Gabungkan
         AVAILABLE_MODELS = flash_models + pro_models + other_models
-        
-        if not AVAILABLE_MODELS:
-            print("⚠️ Tidak ada model ditemukan. Menggunakan default fallback.")
-            AVAILABLE_MODELS = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-pro"]
-            
-        print(f"✅ Siap! {len(AVAILABLE_MODELS)} model aktif. Prioritas utama: {AVAILABLE_MODELS[0]}")
-        
-    except Exception as e:
-        print(f"⚠️ Gagal scan model (Mungkin API Key bermasalah?): {e}")
-        # Tetap isi default agar bot tidak crash saat start
+        if not AVAILABLE_MODELS: AVAILABLE_MODELS = ["gemini-1.5-flash"]
+        print(f"✅ Siap dengan model utama: {AVAILABLE_MODELS[0]}")
+    except:
         AVAILABLE_MODELS = ["gemini-1.5-flash"]
 
-# Jalankan scan saat bot nyala
 refresh_available_models()
 
-# --- FUNGSI 2: GENERATE MOTIVASI (RANDOMIZED) ---
+# --- FUNGSI 2: GENERATE AUDIO (TTS) ---
+async def create_voice_note(text, filename="motivasi.mp3"):
+    """Mengubah teks menjadi suara (Bahasa Indonesia)."""
+    try:
+        # Suara ID: id-ID-GadisNeural (Cewek) atau id-ID-ArdiNeural (Cowok)
+        voice = "id-ID-GadisNeural" 
+        communicate = edge_tts.Communicate(text, voice)
+        await communicate.save(filename)
+        return filename
+    except Exception as e:
+        logging.error(f"Gagal membuat audio: {e}")
+        return None
 
-async def get_gemini_motivation():
-    """Generate motivasi unik dengan topik acak dan failover system."""
+# --- FUNGSI 3: GENERATE TEXT (GEMINI) ---
+async def get_gemini_content():
+    """Generate Motivasi + Action Plan."""
+    topik = random.choice([
+        "disiplin", "kesehatan", "keuangan", "belajar", "karir",
+        "bersyukur", "sabar", "bangkit gagal", "relasi", "produktifitas"
+    ])
     
-    # List topik agar konten selalu fresh
-    topik_list = [
-        "disiplin dan konsistensi", "bangkit dari kegagalan", "bersyukur hal kecil",
-        "kesehatan mental", "fokus masa depan", "belajar skill baru",
-        "kesabaran berproses", "mencintai diri sendiri", "berani ambil resiko",
-        "manajemen waktu", "menghindari penundaan", "kekuatan doa dan usaha"
-    ]
-    
-    topik = random.choice(topik_list)
-    
+    # Prompt meminta struktur khusus (Quote & Challenge)
     prompt = (
-        f"Buatkan satu pesan motivasi singkat (2-3 kalimat) yang sangat 'relate' dan menyentuh hati "
-        f"tentang topik: '{topik}'. "
-        "Gunakan bahasa Indonesia yang santai tapi bijak (tidak kaku). "
-        "Wajib sertakan 1-2 emoji yang relevan."
+        f"Topik: {topik}.\n"
+        "Berikan respons dengan format json (tanpa markdown json) atau format teks terstruktur:\n"
+        "1. Bagian Motivasi: 2 kalimat menyentuh hati, bahasa luwes & akrab.\n"
+        "2. Bagian Tantangan: Satu tugas kecil (micro-action) yang bisa dilakukan user dalam 5 menit ke depan.\n"
+        "Gabungkan keduanya dalam satu paragraf narasi yang enak dibaca untuk dijadikan script voice note. "
+        "Jangan gunakan simbol aneh, gunakan tanda baca yang tepat untuk intonasi suara."
     )
 
-    # Config agar output kreatif (tidak monoton)
-    config = types.GenerateContentConfig(temperature=0.9)
+    config = types.GenerateContentConfig(temperature=0.8)
 
-    # Loop mencoba model satu per satu jika ada yang error/limit
     for model_name in AVAILABLE_MODELS:
         try:
             response = await asyncio.to_thread(
@@ -104,102 +97,109 @@ async def get_gemini_motivation():
                 config=config
             )
             return response.text.strip()
-
         except Exception as e:
-            error_msg = str(e)
-            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-                logging.warning(f"⚠️ {model_name} Limit Habis. Mencoba model lain...")
-                continue # Coba model berikutnya
-            elif "403" in error_msg or "PERMISSION_DENIED" in error_msg:
-                logging.critical("❌ API KEY DITOLAK! Cek konfigurasi di Railway.")
-                return "⚠️ Maaf, sistem sedang maintenance (API Key Error)."
-            elif "404" in error_msg:
-                continue # Skip model tidak valid
-            else:
-                logging.error(f"❌ Error pada {model_name}: {e}")
-                continue
+            if "429" in str(e) or "404" in str(e): continue
+            logging.error(f"Error {model_name}: {e}")
 
-    return "🔥 Tetap semangat! (Sistem AI sedang sibuk, tapi kamu hebat!). 💪"
+    return "Tetap semangat! Minumlah segelas air putih sekarang agar fokusmu kembali."
 
 # --- HANDLER TELEGRAM ---
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    name = update.effective_user.first_name
+async def send_motivation_routine(context: ContextTypes.DEFAULT_TYPE):
+    """Fungsi utama yang mengirim Text + Audio."""
+    job = context.job
+    chat_id = job.chat_id
     
-    welcome_text = (
-        f"👋 **Halo, {name}! Selamat datang!** 🌟\n\n"
-        "Bot Motivasi AI siap menemani harimu.\n"
-        "Saya akan mengirim pesan positif setiap 1 jam agar kamu tetap semangat! 🔥\n\n"
-        "👇 _Perintah:_\n"
-        "⚡ /test - Coba minta motivasi sekarang\n"
-        "🛑 /stop - Berhenti berlangganan"
+    # 1. Ambil Teks dari AI
+    full_text = await get_gemini_content()
+    
+    # 2. Kirim Teks dulu
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🔔 *Reminder Jam Ini:*\n\n{full_text}",
+        parse_mode='Markdown'
     )
     
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    # 3. Buat & Kirim Audio
+    # Kita kirim status "recording voice..."
+    await context.bot.send_chat_action(chat_id=chat_id, action="record_voice")
     
-    # Hapus job lama agar tidak double
+    audio_path = await create_voice_note(full_text, f"voice_{chat_id}.mp3")
+    
+    if audio_path:
+        await context.bot.send_voice(
+            chat_id=chat_id,
+            voice=open(audio_path, 'rb'),
+            caption="🎧 Dengerin ya biar makin semangat!"
+        )
+        # Bersihkan file
+        os.remove(audio_path)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    
+    await update.message.reply_text(
+        "👋 **Halo! Bot Motivasi Suara Aktif!** 🎙️\n\n"
+        "Saya akan mengirimkan:\n"
+        "1. Kata Motivasi 📖\n"
+        "2. Tantangan Aksi (Action Plan) 🔥\n"
+        "3. Voice Note Spesial 🎧\n\n"
+        "⏳ *Jadwal:* Setiap jam tepat (Contoh: 08:00, 09:00, dst)."
+    )
+    
+    # --- LOGIKA PENJADWALAN TEPAT WAKTU ---
+    # Hitung detik menuju jam berikutnya (misal sekarang 07:15 -> next 08:00)
+    now = datetime.datetime.now()
+    next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    seconds_until_next_hour = (next_hour - now).total_seconds()
+    
+    # Hapus job lama
     current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-    for job in current_jobs:
-        job.schedule_removal()
+    for job in current_jobs: job.schedule_removal()
     
-    # Buat job baru (3600 detik = 1 jam)
+    # Job Pertama: Jalan pas di jam berikutnya
+    # Job Selanjutnya: Jalan setiap 3600 detik (1 jam) setelahnya
     context.job_queue.run_repeating(
-        send_hourly_motivation, 
+        send_motivation_routine, 
         interval=3600, 
-        first=10, 
+        first=seconds_until_next_hour, 
         chat_id=chat_id, 
         name=str(chat_id)
+    )
+    
+    await update.message.reply_text(
+        f"✅ Jadwal diatur!\n"
+        f"Pesan pertama akan dikirim pukul: {next_hour.strftime('%H:%M')}\n"
+        f"(Sekitar {int(seconds_until_next_hour//60)} menit lagi)."
     )
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-    
-    if not current_jobs:
-        await update.message.reply_text("Kamu belum berlangganan. Ketik /start untuk mulai.")
-        return
-
-    for job in current_jobs:
-        job.schedule_removal()
-    
-    await update.message.reply_text("✅ Berlangganan dihentikan. Sampai jumpa lagi! 👋")
+    for job in current_jobs: job.schedule_removal()
+    await update.message.reply_text("✅ Berlangganan dihentikan.")
 
 async def test_motivation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ *Meracik kata-kata semangat...*", parse_mode='Markdown')
-    quote = await get_gemini_motivation()
+    """Test manual (langsung kirim tanpa nunggu jam)."""
+    await update.message.reply_text("⏳ Sedang memproses teks & suara...")
     
-    # Update pesan tunggu menjadi quote
-    await context.bot.edit_message_text(
-        chat_id=update.effective_chat.id,
-        message_id=msg.message_id,
-        text=quote
-    )
-
-async def send_hourly_motivation(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    quote = await get_gemini_motivation()
+    # Kita pakai fungsi routine tapi kita inject job dummy
+    class DummyJob:
+        def __init__(self, chat_id): self.chat_id = chat_id
     
-    await context.bot.send_message(
-        chat_id=job.chat_id,
-        text=f"🔔 *Reminder Semangat:*\n\n{quote}",
-        parse_mode='Markdown'
-    )
+    # Hack sedikit context agar fungsi routine bisa dipanggil manual
+    context.job = DummyJob(update.effective_chat.id)
+    await send_motivation_routine(context)
 
-# --- START BOT ---
-
+# --- MAIN ---
 def main():
-    # Inisialisasi Aplikasi dengan JobQueue
     application = Application.builder().token(TOKEN).build()
-
-    # Register Handlers
+    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("test", test_motivation))
-
-    print(f"🚀 Bot Berjalan! Menunggu pesan...")
     
-    # Jalankan polling (Block main thread)
+    print("🚀 Bot Voice Motivasi Berjalan...")
     application.run_polling()
 
 if __name__ == '__main__':
